@@ -5,6 +5,10 @@
  * names physical models. A missing file registers nothing; an invalid one is
  * rejected whole with a message, never partially applied.
  *
+ * An optional top-level `windowKick` block configures the quota-window kicker
+ * (`kick.ts`). It is validated separately: a bad block falls back to its
+ * defaults with a reported reason instead of rejecting the profiles.
+ *
  * ```json
  * {
  *   "profiles": {
@@ -72,10 +76,34 @@ export interface Profile {
 	exhaustion?: Exhaustion;
 }
 
+/** Optional `windowKick` block: start a subscription's 5-hour window after a reset with one minimal request. */
+export interface WindowKickConfig {
+	enabled: boolean;
+	/** provider -> `provider/model` override. A present map replaces the default set of kicked providers. */
+	providers: Record<string, string>;
+	/** Do not kick a provider whose session made a request this recently. */
+	quietMs: number;
+	/** Hard safety cap on issued kicks per provider per UTC day. */
+	maxPerDay: number;
+}
+
+export const DEFAULT_WINDOW_KICK: WindowKickConfig = {
+	enabled: true,
+	providers: { anthropic: "anthropic/claude-haiku-5-5", "openai-codex": "openai-codex/gpt-6-luna" },
+	quietMs: 60_000,
+	maxPerDay: 8,
+};
+
 /** Loaded config, or the reason it was rejected. */
-export type ConfigResult = { ok: true; profiles: Profile[] } | { ok: false; error: string };
+export type ConfigResult =
+	| { ok: true; profiles: Profile[]; windowKick: WindowKickConfig; windowKickError?: string }
+	| { ok: false; error: string };
 
 const PROFILE_ID = /^[a-z0-9][a-z0-9._-]*$/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
@@ -143,6 +171,54 @@ export function parseConfig(raw: unknown): Profile[] {
 	});
 }
 
+function defaultWindowKick(): WindowKickConfig {
+	return { ...DEFAULT_WINDOW_KICK, providers: { ...DEFAULT_WINDOW_KICK.providers } };
+}
+
+function parseWindowKickOrThrow(raw: unknown): WindowKickConfig {
+	if (raw === undefined) return defaultWindowKick();
+	if (!isRecord(raw)) throw new Error("expected an object");
+	const { enabled, providers, quietMs, maxPerDay } = raw;
+	if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("enabled: expected a boolean");
+	if (quietMs !== undefined && (typeof quietMs !== "number" || !Number.isFinite(quietMs) || quietMs < 0)) {
+		throw new Error("quietMs: expected a non-negative number");
+	}
+	if (maxPerDay !== undefined && (typeof maxPerDay !== "number" || !Number.isInteger(maxPerDay) || maxPerDay < 1)) {
+		throw new Error("maxPerDay: expected a positive integer");
+	}
+	let kicked = { ...DEFAULT_WINDOW_KICK.providers };
+	if (providers !== undefined) {
+		if (!isRecord(providers)) throw new Error('providers: expected an object of provider -> "provider/model"');
+		kicked = {};
+		for (const [provider, value] of Object.entries(providers)) {
+			if (typeof value !== "string") throw new Error(`providers.${provider}: expected "provider/model"`);
+			const ref = parseRef(value);
+			if (!ref) throw new Error(`providers.${provider}: expected "provider/model"`);
+			if (ref.provider !== provider) throw new Error(`providers.${provider}: model must belong to ${provider}`);
+			kicked[provider] = value;
+		}
+	}
+	return {
+		enabled: enabled ?? DEFAULT_WINDOW_KICK.enabled,
+		providers: kicked,
+		quietMs: quietMs ?? DEFAULT_WINDOW_KICK.quietMs,
+		maxPerDay: maxPerDay ?? DEFAULT_WINDOW_KICK.maxPerDay,
+	};
+}
+
+/**
+ * Validate the optional `windowKick` block. A malformed block never rejects the
+ * config: the defaults stay in force and the reason is returned, so a typo in
+ * this block cannot take the whole router down.
+ */
+export function parseWindowKick(raw: unknown): { config: WindowKickConfig; error?: string } {
+	try {
+		return { config: parseWindowKickOrThrow(raw) };
+	} catch (error) {
+		return { config: defaultWindowKick(), error: `windowKick: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
 /** Read `<agentDir>/subscription-router.json`. A missing file is an empty config. */
 export async function loadConfig(agentDir: string): Promise<ConfigResult> {
 	const path = join(agentDir, CONFIG_FILE);
@@ -150,11 +226,19 @@ export async function loadConfig(agentDir: string): Promise<ConfigResult> {
 	try {
 		text = await readFile(path, "utf-8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, profiles: [] };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, profiles: [], windowKick: defaultWindowKick() };
 		return { ok: false, error: `${path}: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	try {
-		return { ok: true, profiles: parseConfig(JSON.parse(text)) };
+		const parsed: unknown = JSON.parse(text);
+		const profiles = parseConfig(parsed);
+		const kick = parseWindowKick(isRecord(parsed) ? parsed.windowKick : undefined);
+		return {
+			ok: true,
+			profiles,
+			windowKick: kick.config,
+			...(kick.error === undefined ? {} : { windowKickError: kick.error }),
+		};
 	} catch (error) {
 		return { ok: false, error: `${path}: ${error instanceof Error ? error.message : String(error)}` };
 	}

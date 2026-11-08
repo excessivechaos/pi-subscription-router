@@ -267,7 +267,16 @@ export class Router {
 			const entry = profile.chain.find((item) => sameModel(item, previous.model));
 			if (entry && !this.blockedBy(previous.model)) {
 				const model = env.resolve(entry);
-				if (model) return this.toRoute(entry, model, request.thinkingLevel);
+				if (model) {
+					// Rungs are ordered best-first, so an eligible earlier rung outranks the
+					// incumbent: a fallback must not outlive the block that caused it.
+					const preferred = this.pick(profile, env);
+					if (preferred.ok && this.isEarlier(profile, preferred.entry, entry)) {
+						this.logDecision(profile, reason, preferred);
+						return this.toRoute(preferred.entry, preferred.model, request.thinkingLevel);
+					}
+					return this.toRoute(entry, model, request.thinkingLevel);
+				}
 			}
 		}
 		const picked = this.pick(
@@ -276,6 +285,23 @@ export class Router {
 			reason === "user" && profile.strategy === "balanced" ? previous?.model : undefined,
 		);
 		if (!picked.ok) throw new ChainExhaustedError(profile.id, picked.blocked, picked.resetAt);
+		this.logDecision(profile, reason, picked);
+		return this.toRoute(picked.entry, picked.model, request.thinkingLevel);
+	}
+
+	/** Whether `candidate` sits before `incumbent` in the profile's chain. */
+	private isEarlier(profile: Profile, candidate: ChainEntry, incumbent: ChainEntry): boolean {
+		const candidateIndex = profile.chain.findIndex((item) => sameModel(item, candidate));
+		const incumbentIndex = profile.chain.findIndex((item) => sameModel(item, incumbent));
+		return candidateIndex >= 0 && incumbentIndex >= 0 && candidateIndex < incumbentIndex;
+	}
+
+	/** Record one scored pick for `/router status` and the session decision log. */
+	private logDecision(
+		profile: Profile,
+		reason: ModelRouteRequest["reason"],
+		picked: Extract<PickResult, { ok: true }>,
+	): void {
 		this.onDecision?.({
 			at: this.now(),
 			profile: profile.id,
@@ -289,7 +315,6 @@ export class Router {
 			})),
 			blocked: picked.blocked.map((b) => ({ model: refKey(b.entry), reason: b.reason })),
 		});
-		return this.toRoute(picked.entry, picked.model, request.thinkingLevel);
 	}
 
 	private toRoute(entry: ChainEntry, model: Model<Api>, selected: ModelThinkingLevel): ModelRoute {
