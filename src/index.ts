@@ -44,6 +44,8 @@ const DECISION_ENTRY = "router:decision";
 /** Decisions kept in memory for `/router status`; the session entries are the full record. */
 const RECENT_DECISIONS = 5;
 /** Poll interval for quota-window kicks; the usage cache still limits network reads to one per five minutes. */
+/** Session entry naming the model the next request will use, for extensions that act before it. */
+export const NEXT_ENTRY = "router:next";
 const KICK_POLL_MS = 60_000;
 
 /** The usage cache surface consumed by the extension, including routing decisions. */
@@ -252,6 +254,27 @@ export function createSubscriptionRouter(options?: SubscriptionRouterOptions): E
 			void pumpKicks(ctx);
 		});
 
+		/**
+		 * Tell other extensions which model the next request will use. Only the router can: the pick
+		 * depends on live quota state that is not persisted anywhere. `turn_end` is the earliest point
+		 * where a request is about to follow, and it precedes any settle-time handler, so a consumer at
+		 * `agent_before_settle` never depends on handler order.
+		 */
+		const publishNext = (ctx: ExtensionContext, source: "turn_end" | "recovery", model?: string): void => {
+			try {
+				const profile = selectedProfile(ctx);
+				if (!profile) return;
+				let key = model;
+				if (key === undefined) {
+					const picked = router.pick(profile, routeEnv(ctx, usage));
+					if (!picked.ok) return;
+					key = refKey(picked.entry);
+				}
+				pi.appendEntry(NEXT_ENTRY, { model: key, source, at: now() });
+			} catch {}
+		};
+		pi.on("turn_end", (_event, ctx) => publishNext(ctx, "turn_end"));
+
 		pi.on("agent_before_settle", async (event, ctx) => {
 			const profile = selectedProfile(ctx);
 			if (!profile) return undefined;
@@ -261,6 +284,7 @@ export function createSubscriptionRouter(options?: SubscriptionRouterOptions): E
 				return undefined;
 			}
 			if (outcome.kind !== "continue") return undefined;
+			publishNext(ctx, "recovery", outcome.to);
 			ctx.ui.notify(`subscription-router: ${outcome.from} is out of quota, continuing on ${outcome.to}`, "warning");
 			return outcome.result;
 		});
