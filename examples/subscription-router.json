@@ -1,0 +1,13 @@
+{
+  "profiles": {
+    "cheap": {
+      "name": "Router cheap",
+      "strategy": "ordered",
+      "chain": [
+        { "model": "anthropic/claude-haiku-5-5" },
+        { "model": "openai-codex/gpt-6-luna" }
+      ],
+      "exhaustionPolicy": "wait"
+    }
+  }
+}
