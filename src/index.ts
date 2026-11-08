@@ -46,6 +46,12 @@ const RECENT_DECISIONS = 5;
 /** Poll interval for quota-window kicks; the usage cache still limits network reads to one per five minutes. */
 /** Session entry naming the model the next request will use, for extensions that act before it. */
 export const NEXT_ENTRY = "router:next";
+/**
+ * Live accessor on `globalThis`: `(ctx) => "provider/id" | undefined`, the model the router would use
+ * for the next request of the context's selected profile. Unlike the entry it has no ordering
+ * dependency on handlers, and it always reflects current quota marks.
+ */
+export const PEEK_NEXT = Symbol.for("pi-subscription-router:peek-next");
 const KICK_POLL_MS = 60_000;
 
 /** The usage cache surface consumed by the extension, including routing decisions. */
@@ -254,6 +260,16 @@ export function createSubscriptionRouter(options?: SubscriptionRouterOptions): E
 			void pumpKicks(ctx);
 		});
 
+		(globalThis as Record<symbol, unknown>)[PEEK_NEXT] = (ctx: ExtensionContext): string | undefined => {
+			try {
+				const profile = selectedProfile(ctx);
+				if (!profile) return undefined;
+				const picked = router.pick(profile, routeEnv(ctx, usage));
+				return picked.ok ? refKey(picked.entry) : undefined;
+			} catch {
+				return undefined;
+			}
+		};
 		/**
 		 * Tell other extensions which model the next request will use. Only the router can: the pick
 		 * depends on live quota state that is not persisted anywhere. `turn_end` is the earliest point
